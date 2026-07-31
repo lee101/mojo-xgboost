@@ -68,6 +68,12 @@ more.
 
 Design notes:
 
+- prediction reads `x_t[f * n + r]` (feature-major) rather than `x[r * d + f]`:
+  every thread in a warp walks the same tree node and therefore the same feature,
+  so the feature-major read is fully coalesced where the row-major one costs a
+  transaction per thread. Found by `mojogpu --explain src/gpu.mojo`, which flags
+  the strided access statically; pass `feature_major=False` to compare;
+
 - the histogram reads bins **feature-major** (`bins_t[f * n + r]`) so adjacent
   threads touch adjacent addresses; `mxgb_gpu_quantize` writes both layouts in one
   pass, making the transpose free;

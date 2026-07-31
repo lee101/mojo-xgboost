@@ -27,7 +27,7 @@ _SIGNATURES = {
     "mxgb_gpu_available": ([], I),
     "mxgb_gpu_quantize": ([I] * 7, I),
     "mxgb_gpu_hist": ([I] * 10, I),
-    "mxgb_gpu_predict": ([I] * 6 + [I, I, I, I, F], I),
+    "mxgb_gpu_predict": ([I] * 6 + [I, I, I, I, F, I], I),
 }
 
 # Below these sizes the PCIe round trip costs more than the kernel saves; the
@@ -112,7 +112,7 @@ def histogram(bins_t: np.ndarray, grad: np.ndarray, hess: np.ndarray,
 
 def predict(x: np.ndarray, features: np.ndarray, thresholds: np.ndarray,
             defaults: np.ndarray, leaves: np.ndarray, n_trees: int,
-            max_nodes: int, base_margin: float = 0.0):
+            max_nodes: int, base_margin: float = 0.0, feature_major: bool = True):
     """-> pred [n] or None."""
     n, d = x.shape
     if not available() or n * n_trees < MIN_PREDICT_WORK:
@@ -124,8 +124,13 @@ def predict(x: np.ndarray, features: np.ndarray, thresholds: np.ndarray,
     defaults = np.ascontiguousarray(defaults, dtype=np.int64)
     leaves = np.ascontiguousarray(leaves, dtype=np.float64)
     pred = np.empty(n, dtype=np.float64)
+    # Feature-major copy: every thread in a warp walks the same tree node, so it
+    # reads the same feature — `x_t[f * n + r]` is then perfectly coalesced where
+    # `x[r * d + f]` costs one transaction per thread. Worth the transpose.
+    x_t = np.ascontiguousarray(x.T) if feature_major else None
     rc = handle.mxgb_gpu_predict(
         addr(x), addr(features), addr(thresholds), addr(defaults), addr(leaves),
         addr(pred), n, d, n_trees, max_nodes, ctypes.c_double(base_margin),
+        addr(x_t) if x_t is not None else 0,
     )
     return pred if rc == 0 else None

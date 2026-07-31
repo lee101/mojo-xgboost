@@ -149,6 +149,7 @@ def hist_kernel(
 
 def predict_kernel(
     x: UnsafePointer[Float64, AnyOrigin[mut=True]],
+    x_t: UnsafePointer[Float64, AnyOrigin[mut=True]],
     features: UnsafePointer[Int64, AnyOrigin[mut=True]],
     thresholds: UnsafePointer[Float64, AnyOrigin[mut=True]],
     defaults: UnsafePointer[Int64, AnyOrigin[mut=True]],
@@ -159,6 +160,7 @@ def predict_kernel(
     n_trees: Int,
     max_nodes: Int,
     base_margin: Float64,
+    feature_major: Int,
 ):
     var r = Int(global_idx.x)
     if r >= n:
@@ -169,7 +171,11 @@ def predict_kernel(
         var node = 0
         while features[tree_base + node] >= 0:
             var f = Int(features[tree_base + node])
-            var value = x[r * d + f]
+            # Row-major `x[r * d + f]` makes adjacent threads read addresses `d`
+            # apart — one memory transaction per thread instead of per warp.
+            # Feature-major `x_t[f * n + r]` is fully coalesced, because every
+            # thread in a warp walks the same node and therefore the same f.
+            var value = x_t[f * n + r] if feature_major != 0 else x[r * d + f]
             var go_left = False
             if isnan(value):
                 go_left = defaults[tree_base + node] != 0
@@ -320,6 +326,7 @@ def mxgb_gpu_predict(
     n_trees: Int,
     max_nodes: Int,
     base_margin: Float64,
+    x_t_addr: Int,
 ) abi("C") -> Int:
     if n <= 0 or d <= 0 or n_trees <= 0 or max_nodes <= 0:
         return ERR_ARGS
@@ -331,18 +338,22 @@ def mxgb_gpu_predict(
     try:
         var ctx = DeviceContext()
         var dx = ctx.enqueue_create_buffer[DType.float64](n * d)
+        var dxt = ctx.enqueue_create_buffer[DType.float64](n * d if x_t_addr != 0 else 1)
         var df = ctx.enqueue_create_buffer[DType.int64](tree_len)
         var dt = ctx.enqueue_create_buffer[DType.float64](tree_len)
         var dd = ctx.enqueue_create_buffer[DType.int64](tree_len)
         var dl = ctx.enqueue_create_buffer[DType.float64](tree_len)
         var dp = ctx.enqueue_create_buffer[DType.float64](n)
         ctx.enqueue_copy(dx, fp(x_addr))
+        if x_t_addr != 0:
+            ctx.enqueue_copy(dxt, fp(x_t_addr))
         ctx.enqueue_copy(df, ip(feature_addr))
         ctx.enqueue_copy(dt, fp(threshold_addr))
         ctx.enqueue_copy(dd, ip(default_addr))
         ctx.enqueue_copy(dl, fp(leaf_addr))
         ctx.enqueue_function[predict_kernel](
             dx,
+            dxt,
             df,
             dt,
             dd,
@@ -353,6 +364,7 @@ def mxgb_gpu_predict(
             n_trees,
             max_nodes,
             base_margin,
+            1 if x_t_addr != 0 else 0,
             grid_dim=(n + BLOCK - 1) // BLOCK,
             block_dim=BLOCK,
         )
