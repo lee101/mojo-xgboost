@@ -15,6 +15,7 @@ PYTHONPATH = "python"
 
 [dependencies]
 mojo = "==1.0.0b3.dev2026072406"
+max = ">=26.5.0.dev2026072406,<27"   # libmax.so: required for the GPU path
 python = "3.13.*"
 pytest = "*"
 numpy = "*"

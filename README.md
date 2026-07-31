@@ -35,7 +35,7 @@ Not implemented:
 - multiclass, ranking, survival, count, and custom prediction transforms;
 - `dart`, `gblinear`, exact/approx tree methods, loss-guide growth, monotonic or
   interaction constraints;
-- distributed and GPU execution;
+- distributed execution;
 - SHAP contributions or compatibility with upstream XGBoost model files.
 
 The public names and commonly used signatures match upstream for this subset,
@@ -43,6 +43,46 @@ but floating-point predictions are not expected to be identical on arbitrary
 data. The quantile sketch and several tie-breaking details differ. Tests assert
 exact results where the algorithms coincide and held-out numerical/behavioral
 parity elsewhere.
+
+## GPU
+
+`src/gpu.mojo` builds to a second shared library, `dist/libmojo-xgboost-gpu.so`,
+and covers the three stages that are wide, regular and independent per element:
+
+| stage | shape | CPU | GPU (Mojo) | speedup |
+|---|---|---|---|---|
+| quantize | 100k x 32 | 104.8 ms | 21.3 ms | 4.9x |
+| quantize | 2M x 64 | 4543.3 ms | 2319.1 ms | 2.0x |
+| histogram | 100k x 32 | 43.6 ms | 5.4 ms | 8.1x |
+| histogram | 500k x 64 | 1102.4 ms | 42.6 ms | 25.9x |
+| histogram | 2M x 64 | 4645.2 ms | 169.5 ms | 27.4x |
+| predict | 500k rows x 200 trees | 6481.0 ms | 34.6 ms | 187x |
+
+RTX 5090, `bench/bench_gpu.py`, timings **include** the host-device copies because
+that is what a caller pays. CPU is this project's own Mojo SIMD kernel for quantize
+and predict, and NumPy `bincount` for the histogram (`np.add.at` would have made
+the GPU look ~50x better than it is). Quantize is transfer-bound — a binary search
+over a cached cut vector is only a few ALU ops per value — which is exactly why the
+histogram and prediction kernels, which reuse data on the device, win by so much
+more.
+
+Design notes:
+
+- the histogram reads bins **feature-major** (`bins_t[f * n + r]`) so adjacent
+  threads touch adjacent addresses; `mxgb_gpu_quantize` writes both layouts in one
+  pass, making the transpose free;
+- each block accumulates into a shared-memory histogram and commits once with
+  global atomics, so global traffic is `blocks * max_bin` rather than `n * d`;
+- `max_bin <= 256` on the GPU path (the shared histogram is 2 x 256 x 8 B = 4 KiB
+  per block); larger values fall back to the CPU;
+- below ~2M cells the PCIe round trip costs more than the kernel saves, so the
+  bridge declines and the CPU kernel runs. The thresholds are in `python/mojo_xgboost/_gpu.py`.
+
+Availability is re-checked at call time, never assumed: another process holding the
+card makes `DeviceContext()` fail with OOM, and every entry point then returns
+`None` so the CPU path runs. `MOJO_XGBOOST_DISABLE_GPU=1` forces that. Parity with
+the CPU kernels is asserted in `tests/test_gpu.py` — quantize and predict are exact,
+the histogram matches `bincount` to 1e-9 (float reassociation only).
 
 ## Install
 
