@@ -1,6 +1,6 @@
 """Dense histogram tree kernels exposed through a stable C ABI."""
 
-from std.algorithm import parallelize
+from max.algorithm import parallelize
 from std.math import iota
 from std.sys.info import simd_width_of as simdwidthof
 from std.utils.numerics import isnan
