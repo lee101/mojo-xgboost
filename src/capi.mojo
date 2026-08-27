@@ -162,20 +162,15 @@ def predict_leaf_rows(
 
 def partition_row_range(
     bins: IPtr,
-    grad: FPtr,
-    hess: FPtr,
     features: IPtr,
     split_bins: IPtr,
     defaults: IPtr,
     row_nodes: IPtr,
-    node_grad: FPtr,
-    node_hess: FPtr,
     start: Int,
     end: Int,
     d: Int,
     level_start: Int,
     level_end: Int,
-    update_totals: Bool,
 ):
     for r in range(start, end):
         var node = Int(row_nodes[r])
@@ -193,9 +188,6 @@ def partition_row_range(
             go_left = b <= Int(split_bins[node])
         var child = 2 * node + 1 if go_left else 2 * node + 2
         row_nodes[r] = Int64(child)
-        if update_totals:
-            node_grad[child] += grad[r]
-            node_hess[child] += hess[r]
 
 
 @export("mxgb_quantize")
@@ -329,6 +321,18 @@ def mxgb_build_tree(
         node_hess[node] = 0.0
     for r in range(n):
         row_nodes[r] = 0
+    comptime W = simdwidthof[DType.float64]()
+    var vector_rows = n - n % W
+    var root_grad = SIMD[DType.float64, W](0.0)
+    var root_hess = SIMD[DType.float64, W](0.0)
+    for r in range(0, vector_rows, W):
+        root_grad += grad.load[width=W](r)
+        root_hess += hess.load[width=W](r)
+    node_grad[0] = root_grad.reduce_add()
+    node_hess[0] = root_hess.reduce_add()
+    for r in range(vector_rows, n):
+        node_grad[0] += grad[r]
+        node_hess[0] += hess[r]
 
     var split_count = 0
     for depth in range(max_depth + 1):
@@ -340,11 +344,6 @@ def mxgb_build_tree(
             hist_grad[i] = 0.0
             hist_hess[i] = 0.0
         if n_threads > 1 and n * d >= PARALLEL_WORK and d > 1:
-            if depth == 0:
-                for r in range(n):
-                    node_grad[0] += grad[r]
-                    node_hess[0] += hess[r]
-
             @parameter
             def build_feature(f: Int):
                 for r in range(n):
@@ -408,10 +407,7 @@ def mxgb_build_tree(
                 var node = Int(row_nodes[r])
                 if node < level_start or node >= level_end:
                     continue
-                if depth == 0:
-                    node_grad[0] += grad[r]
-                    node_hess[0] += hess[r]
-                elif depth > 0:
+                if depth > 0:
                     var parent = (node - 1) // 2
                     var left = 2 * parent + 1
                     var build_node = (
@@ -480,6 +476,10 @@ def mxgb_build_tree(
             var best_feature = -1
             var best_bin = -1
             var best_default = 0
+            var best_left_g = 0.0
+            var best_left_h = 0.0
+            var best_right_g = 0.0
+            var best_right_h = 0.0
             for f in range(d):
                 var base = (node * d + f) * max_bin
                 var present_g = 0.0
@@ -515,6 +515,10 @@ def mxgb_build_tree(
                             best_feature = f
                             best_bin = b
                             best_default = 0
+                            best_left_g = left_g
+                            best_left_h = left_h
+                            best_right_g = right_g
+                            best_right_h = right_h
 
                     left_g = prefix_g + missing_g
                     left_h = prefix_h + missing_h
@@ -531,19 +535,24 @@ def mxgb_build_tree(
                             best_feature = f
                             best_bin = b
                             best_default = 1
+                            best_left_g = left_g
+                            best_left_h = left_h
+                            best_right_g = right_g
+                            best_right_h = right_h
 
             if best_feature >= 0:
                 features[node] = Int64(best_feature)
                 split_bins[node] = Int64(best_bin)
                 defaults[node] = Int64(best_default)
                 gains[node] = best_gain
+                var left = 2 * node + 1
+                node_grad[left] = best_left_g
+                node_hess[left] = best_left_h
+                node_grad[left + 1] = best_right_g
+                node_hess[left + 1] = best_right_h
                 split_count += 1
 
         if depth < max_depth:
-            var next_level_end = (1 << (depth + 2)) - 1
-            for node in range(level_end, next_level_end):
-                node_grad[node] = 0.0
-                node_hess[node] = 0.0
             if n_threads > 1 and n >= PARALLEL_WORK:
                 var chunks = (n + PREDICT_CHUNK - 1) // PREDICT_CHUNK
 
@@ -552,45 +561,30 @@ def mxgb_build_tree(
                     var start = chunk * PREDICT_CHUNK
                     partition_row_range(
                         bins,
-                        grad,
-                        hess,
                         features,
                         split_bins,
                         defaults,
                         row_nodes,
-                        node_grad,
-                        node_hess,
                         start,
                         min(start + PREDICT_CHUNK, n),
                         d,
                         level_start,
                         level_end,
-                        False,
                     )
 
                 parallelize[partition_chunk](chunks, n_threads)
-                for r in range(n):
-                    var node = Int(row_nodes[r])
-                    if node >= level_end and node < next_level_end:
-                        node_grad[node] += grad[r]
-                        node_hess[node] += hess[r]
             else:
                 partition_row_range(
                     bins,
-                    grad,
-                    hess,
                     features,
                     split_bins,
                     defaults,
                     row_nodes,
-                    node_grad,
-                    node_hess,
                     0,
                     n,
                     d,
                     level_start,
                     level_end,
-                    True,
                 )
 
     return split_count

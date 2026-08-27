@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 
 import numpy as np
 
@@ -35,6 +36,8 @@ _SIGNATURES = {
 MIN_QUANTIZE_CELLS = 2_000_000
 MIN_HIST_CELLS = 2_000_000
 MIN_PREDICT_WORK = 4_000_000  # rows * trees
+MIN_FREE_MIB = 4_000
+MAX_DEVICE_BYTES = 2_000_000_000
 
 _handle: ctypes.CDLL | None = None
 _available: bool | None = None
@@ -71,10 +74,37 @@ def available() -> bool:
     return _available
 
 
+def _has_headroom(device_bytes: int) -> bool:
+    if device_bytes >= MAX_DEVICE_BYTES:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        free = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return result.returncode == 0 and bool(free) and min(free) >= MIN_FREE_MIB
+
+
 def quantize(x: np.ndarray, cuts: np.ndarray, max_bin: int):
     """-> (bins [n,d], bins_t [d,n]) or None if the GPU path did not run."""
     n, d = x.shape
-    if not available() or n * d < MIN_QUANTIZE_CELLS:
+    cells = n * d
+    device_bytes = 3 * cells * 8 + d * (max_bin - 1) * 8
+    if (
+        not available()
+        or cells < MIN_QUANTIZE_CELLS
+        or not _has_headroom(device_bytes)
+    ):
         return None
     handle = lib()
     x = np.ascontiguousarray(x, dtype=np.float64)
@@ -91,7 +121,13 @@ def histogram(bins_t: np.ndarray, grad: np.ndarray, hess: np.ndarray,
               row_nodes: np.ndarray | None, max_bin: int, node: int = -1):
     """-> (hist_grad [d,max_bin], hist_hess) or None."""
     d, n = bins_t.shape
-    if not available() or n * d < MIN_HIST_CELLS or max_bin > 256:
+    device_bytes = n * d * 8 + 3 * n * 8 + 2 * d * max_bin * 8
+    if (
+        not available()
+        or n * d < MIN_HIST_CELLS
+        or max_bin > 256
+        or not _has_headroom(device_bytes)
+    ):
         return None
     handle = lib()
     bins_t = np.ascontiguousarray(bins_t, dtype=np.int64)
@@ -115,7 +151,13 @@ def predict(x: np.ndarray, features: np.ndarray, thresholds: np.ndarray,
             max_nodes: int, base_margin: float = 0.0, feature_major: bool = True):
     """-> pred [n] or None."""
     n, d = x.shape
-    if not available() or n * n_trees < MIN_PREDICT_WORK:
+    tree_len = n_trees * max_nodes
+    device_bytes = (2 if feature_major else 1) * n * d * 8 + tree_len * 32 + n * 8
+    if (
+        not available()
+        or n * n_trees < MIN_PREDICT_WORK
+        or not _has_headroom(device_bytes)
+    ):
         return None
     handle = lib()
     x = np.ascontiguousarray(x, dtype=np.float64)

@@ -19,13 +19,19 @@ def _value(params: dict[str, Any], name: str, alias: str, default: Any) -> Any:
 def _cuts(x: np.ndarray, max_bin: int) -> np.ndarray:
     result = np.full((x.shape[1], max_bin - 1), np.inf, dtype=np.float64)
     probabilities = np.arange(1, max_bin, dtype=np.float64) / max_bin
-    for feature in range(x.shape[1]):
-        values = x[:, feature]
-        values = values[~np.isnan(values)]
-        if not values.size:
-            continue
-        quantiles = np.unique(np.quantile(values, probabilities, method="inverted_cdf"))
-        result[feature, : quantiles.size] = quantiles
+    missing = np.isnan(x)
+    populated = np.flatnonzero(~np.all(missing, axis=0))
+    if not populated.size:
+        return result
+    values = x if populated.size == x.shape[1] else x[:, populated]
+    quantiles = (
+        np.nanquantile(values, probabilities, axis=0, method="inverted_cdf")
+        if np.any(missing)
+        else np.quantile(values, probabilities, axis=0, method="inverted_cdf")
+    )
+    for index, feature in enumerate(populated):
+        unique = np.unique(quantiles[:, index])
+        result[feature, : unique.size] = unique
     return result
 
 
