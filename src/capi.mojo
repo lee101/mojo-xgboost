@@ -1,6 +1,5 @@
 """Dense histogram tree kernels exposed through a stable C ABI."""
 
-from max.algorithm import parallelize
 from std.math import iota
 from std.sys.info import simd_width_of as simdwidthof
 from std.utils.numerics import isnan
@@ -343,86 +342,26 @@ def mxgb_build_tree(
         for i in range(hist_start, hist_end):
             hist_grad[i] = 0.0
             hist_hess[i] = 0.0
-        if n_threads > 1 and n * d >= PARALLEL_WORK and d > 1:
-            @parameter
-            def build_feature(f: Int):
-                for r in range(n):
-                    var node = Int(row_nodes[r])
-                    if node < level_start or node >= level_end:
-                        continue
-                    if depth > 0:
-                        var parent = (node - 1) // 2
-                        var left = 2 * parent + 1
-                        var build_node = (
-                            left
-                            if node_hess[left] <= node_hess[left + 1]
-                            else left + 1
-                        )
-                        if node != build_node:
-                            continue
-                    var b = Int(bins[r * d + f])
-                    if b >= 0:
-                        var pos = (node * d + f) * max_bin + b
-                        hist_grad[pos] += grad[r]
-                        hist_hess[pos] += hess[r]
-                if depth > 0:
-                    comptime W = simdwidthof[DType.float64]()
-                    var vector_end = max_bin - max_bin % W
-                    var parent_start = (level_start - 1) // 2
-                    for parent in range(parent_start, level_start):
-                        var left = 2 * parent + 1
-                        var built = (
-                            left
-                            if node_hess[left] <= node_hess[left + 1]
-                            else left + 1
-                        )
-                        var sibling = left + 1 if built == left else left
-                        var parent_base = (parent * d + f) * max_bin
-                        var built_base = (built * d + f) * max_bin
-                        var sibling_base = (sibling * d + f) * max_bin
-                        for b in range(0, vector_end, W):
-                            var grad_vec = (
-                                hist_grad.load[width=W](parent_base + b)
-                                - hist_grad.load[width=W](built_base + b)
-                            )
-                            var hess_vec = (
-                                hist_hess.load[width=W](parent_base + b)
-                                - hist_hess.load[width=W](built_base + b)
-                            )
-                            hist_grad.store(sibling_base + b, grad_vec)
-                            hist_hess.store(sibling_base + b, hess_vec)
-                        for b in range(vector_end, max_bin):
-                            hist_grad[sibling_base + b] = (
-                                hist_grad[parent_base + b]
-                                - hist_grad[built_base + b]
-                            )
-                            hist_hess[sibling_base + b] = (
-                                hist_hess[parent_base + b]
-                                - hist_hess[built_base + b]
-                            )
-
-            parallelize[build_feature](d, n_threads)
-        else:
-            for r in range(n):
-                var node = Int(row_nodes[r])
-                if node < level_start or node >= level_end:
+        for r in range(n):
+            var node = Int(row_nodes[r])
+            if node < level_start or node >= level_end:
+                continue
+            if depth > 0:
+                var parent = (node - 1) // 2
+                var left = 2 * parent + 1
+                var build_node = (
+                    left
+                    if node_hess[left] <= node_hess[left + 1]
+                    else left + 1
+                )
+                if node != build_node:
                     continue
-                if depth > 0:
-                    var parent = (node - 1) // 2
-                    var left = 2 * parent + 1
-                    var build_node = (
-                        left
-                        if node_hess[left] <= node_hess[left + 1]
-                        else left + 1
-                    )
-                    if node != build_node:
-                        continue
-                for f in range(d):
-                    var b = Int(bins[r * d + f])
-                    if b >= 0:
-                        var pos = (node * d + f) * max_bin + b
-                        hist_grad[pos] += grad[r]
-                        hist_hess[pos] += hess[r]
+            for f in range(d):
+                var b = Int(bins[r * d + f])
+                if b >= 0:
+                    var pos = (node * d + f) * max_bin + b
+                    hist_grad[pos] += grad[r]
+                    hist_hess[pos] += hess[r]
             if depth > 0:
                 comptime W = simdwidthof[DType.float64]()
                 var vector_end = max_bin - max_bin % W
@@ -553,39 +492,18 @@ def mxgb_build_tree(
                 split_count += 1
 
         if depth < max_depth:
-            if n_threads > 1 and n >= PARALLEL_WORK:
-                var chunks = (n + PREDICT_CHUNK - 1) // PREDICT_CHUNK
-
-                @parameter
-                def partition_chunk(chunk: Int):
-                    var start = chunk * PREDICT_CHUNK
-                    partition_row_range(
-                        bins,
-                        features,
-                        split_bins,
-                        defaults,
-                        row_nodes,
-                        start,
-                        min(start + PREDICT_CHUNK, n),
-                        d,
-                        level_start,
-                        level_end,
-                    )
-
-                parallelize[partition_chunk](chunks, n_threads)
-            else:
-                partition_row_range(
-                    bins,
-                    features,
-                    split_bins,
-                    defaults,
-                    row_nodes,
-                    0,
-                    n,
-                    d,
-                    level_start,
-                    level_end,
-                )
+            partition_row_range(
+                bins,
+                features,
+                split_bins,
+                defaults,
+                row_nodes,
+                0,
+                n,
+                d,
+                level_start,
+                level_end,
+            )
 
     return split_count
 
@@ -618,49 +536,66 @@ def mxgb_predict(
         or pred_addr == 0
     ):
         return
-    var x = fp(x_addr)
-    var features = ip(feature_addr)
-    var thresholds = fp(threshold_addr)
-    var defaults = ip(default_left_addr)
-    var leaves = fp(leaf_addr)
-    var pred = fp(pred_addr)
-    if n_threads > 1 and n * n_trees >= PARALLEL_WORK:
-        var chunks = (n + PREDICT_CHUNK - 1) // PREDICT_CHUNK
+    mxgb_predict_range(
+        x_addr,
+        feature_addr,
+        threshold_addr,
+        default_left_addr,
+        leaf_addr,
+        pred_addr,
+        n,
+        d,
+        n_trees,
+        max_nodes,
+        base_margin,
+        0,
+        n,
+    )
 
-        @parameter
-        def predict_chunk(chunk: Int):
-            var start = chunk * PREDICT_CHUNK
-            predict_margin_rows(
-                x,
-                features,
-                thresholds,
-                defaults,
-                leaves,
-                pred,
-                start,
-                min(start + PREDICT_CHUNK, n),
-                d,
-                n_trees,
-                max_nodes,
-                base_margin,
-            )
 
-        parallelize[predict_chunk](chunks, n_threads)
-    else:
-        predict_margin_rows(
-            x,
-            features,
-            thresholds,
-            defaults,
-            leaves,
-            pred,
-            0,
-            n,
-            d,
-            n_trees,
-            max_nodes,
-            base_margin,
-        )
+@export("mxgb_predict_range")
+def mxgb_predict_range(
+    x_addr: Int,
+    feature_addr: Int,
+    threshold_addr: Int,
+    default_left_addr: Int,
+    leaf_addr: Int,
+    pred_addr: Int,
+    n: Int,
+    d: Int,
+    n_trees: Int,
+    max_nodes: Int,
+    base_margin: Float64,
+    start: Int,
+    stop: Int,
+) abi("C"):
+    if n <= 0 or n_trees <= 0:
+        return
+    if (
+        d <= 0
+        or max_nodes <= 0
+        or x_addr == 0
+        or feature_addr == 0
+        or threshold_addr == 0
+        or default_left_addr == 0
+        or leaf_addr == 0
+        or pred_addr == 0
+    ):
+        return
+    predict_margin_rows(
+        fp(x_addr),
+        ip(feature_addr),
+        fp(threshold_addr),
+        ip(default_left_addr),
+        fp(leaf_addr),
+        fp(pred_addr),
+        start,
+        stop,
+        d,
+        n_trees,
+        max_nodes,
+        base_margin,
+    )
 
 
 @export("mxgb_predict_add")
@@ -687,35 +622,56 @@ def mxgb_predict_add(
         or pred_addr == 0
     ):
         return
-    var x = fp(x_addr)
-    var features = ip(feature_addr)
-    var thresholds = fp(threshold_addr)
-    var defaults = ip(default_left_addr)
-    var leaves = fp(leaf_addr)
-    var pred = fp(pred_addr)
-    if n_threads > 1 and n >= PARALLEL_WORK:
-        var chunks = (n + PREDICT_CHUNK - 1) // PREDICT_CHUNK
+    mxgb_predict_add_range(
+        x_addr,
+        feature_addr,
+        threshold_addr,
+        default_left_addr,
+        leaf_addr,
+        pred_addr,
+        n,
+        d,
+        0,
+        n,
+    )
 
-        @parameter
-        def predict_add_chunk(chunk: Int):
-            var start = chunk * PREDICT_CHUNK
-            predict_add_rows(
-                x,
-                features,
-                thresholds,
-                defaults,
-                leaves,
-                pred,
-                start,
-                min(start + PREDICT_CHUNK, n),
-                d,
-            )
 
-        parallelize[predict_add_chunk](chunks, n_threads)
-    else:
-        predict_add_rows(
-            x, features, thresholds, defaults, leaves, pred, 0, n, d
-        )
+@export("mxgb_predict_add_range")
+def mxgb_predict_add_range(
+    x_addr: Int,
+    feature_addr: Int,
+    threshold_addr: Int,
+    default_left_addr: Int,
+    leaf_addr: Int,
+    pred_addr: Int,
+    n: Int,
+    d: Int,
+    start: Int,
+    stop: Int,
+) abi("C"):
+    if n <= 0:
+        return
+    if (
+        d <= 0
+        or x_addr == 0
+        or feature_addr == 0
+        or threshold_addr == 0
+        or default_left_addr == 0
+        or leaf_addr == 0
+        or pred_addr == 0
+    ):
+        return
+    predict_add_rows(
+        fp(x_addr),
+        ip(feature_addr),
+        fp(threshold_addr),
+        ip(default_left_addr),
+        fp(leaf_addr),
+        fp(pred_addr),
+        start,
+        stop,
+        d,
+    )
 
 
 @export("mxgb_predict_leaf")
@@ -743,41 +699,56 @@ def mxgb_predict_leaf(
         or leaf_index_addr == 0
     ):
         return
-    var x = fp(x_addr)
-    var features = ip(feature_addr)
-    var thresholds = fp(threshold_addr)
-    var defaults = ip(default_left_addr)
-    var leaf_indices = ip(leaf_index_addr)
-    if n_threads > 1 and n * n_trees >= PARALLEL_WORK:
-        var chunks = (n + PREDICT_CHUNK - 1) // PREDICT_CHUNK
+    mxgb_predict_leaf_range(
+        x_addr,
+        feature_addr,
+        threshold_addr,
+        default_left_addr,
+        leaf_index_addr,
+        n,
+        d,
+        n_trees,
+        max_nodes,
+        0,
+        n,
+    )
 
-        @parameter
-        def predict_leaf_chunk(chunk: Int):
-            var start = chunk * PREDICT_CHUNK
-            predict_leaf_rows(
-                x,
-                features,
-                thresholds,
-                defaults,
-                leaf_indices,
-                start,
-                min(start + PREDICT_CHUNK, n),
-                d,
-                n_trees,
-                max_nodes,
-            )
 
-        parallelize[predict_leaf_chunk](chunks, n_threads)
-    else:
-        predict_leaf_rows(
-            x,
-            features,
-            thresholds,
-            defaults,
-            leaf_indices,
-            0,
-            n,
-            d,
-            n_trees,
-            max_nodes,
-        )
+@export("mxgb_predict_leaf_range")
+def mxgb_predict_leaf_range(
+    x_addr: Int,
+    feature_addr: Int,
+    threshold_addr: Int,
+    default_left_addr: Int,
+    leaf_index_addr: Int,
+    n: Int,
+    d: Int,
+    n_trees: Int,
+    max_nodes: Int,
+    start: Int,
+    stop: Int,
+) abi("C"):
+    if n <= 0 or n_trees <= 0:
+        return
+    if (
+        d <= 0
+        or max_nodes <= 0
+        or x_addr == 0
+        or feature_addr == 0
+        or threshold_addr == 0
+        or default_left_addr == 0
+        or leaf_index_addr == 0
+    ):
+        return
+    predict_leaf_rows(
+        fp(x_addr),
+        ip(feature_addr),
+        fp(threshold_addr),
+        ip(default_left_addr),
+        ip(leaf_index_addr),
+        start,
+        stop,
+        d,
+        n_trees,
+        max_nodes,
+    )

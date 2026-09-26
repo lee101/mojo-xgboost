@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -17,9 +18,17 @@ _SIGNATURES = {
     "mxgb_quantize": ([I, I, I, I, I, I], None),
     "mxgb_build_tree": ([I] * 14 + [I, I, I, I] + [F] * 5 + [I], I),
     "mxgb_predict": ([I, I, I, I, I, I, I, I, I, I, F, I], None),
+    "mxgb_predict_range": ([I, I, I, I, I, I, I, I, I, I, F, I, I], None),
     "mxgb_predict_add": ([I, I, I, I, I, I, I, I, I], None),
+    "mxgb_predict_add_range": ([I, I, I, I, I, I, I, I, I, I], None),
     "mxgb_predict_leaf": ([I, I, I, I, I, I, I, I, I, I], None),
+    "mxgb_predict_leaf_range": ([I] * 11, None),
 }
+
+# Per-row tree walks are latency-bound on dependent gathers, not bandwidth-bound,
+# so they scale with cores. Below this many row-trees the thread hand-off costs
+# more than the walk.
+CHUNK_WORK = 200_000
 
 _handle: ctypes.CDLL | None = None
 
@@ -85,3 +94,26 @@ def i64(data, *, copy: bool = False) -> np.ndarray:
     if copy:
         return np.array(array, dtype=np.int64, order="C", copy=True)
     return np.ascontiguousarray(array, dtype=np.int64)
+
+
+def run_row_kernel(name: str, arguments, rows: int, n_threads: int, work: int):
+    """Call a per-row kernel over `rows`, fanning out over `n_threads` chunks.
+
+    Every row is independent and each chunk writes a disjoint output range, so
+    the result does not depend on how the rows are split.
+    """
+    function = getattr(lib(), name)
+    workers = min(n_threads, rows, os.cpu_count() or 1) if n_threads > 0 else 1
+    if workers <= 1 or work < CHUNK_WORK:
+        function(*arguments, 0, rows)
+        return
+    step = -(-rows // workers)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(
+            pool.map(
+                lambda part: function(
+                    *arguments, part * step, min((part + 1) * step, rows)
+                ),
+                range(workers),
+            )
+        )

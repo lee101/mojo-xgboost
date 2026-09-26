@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from ._lib import addr, f64, i64, lib
+from ._lib import addr, f64, i64, lib, run_row_kernel
 
 
 def _matrix(data: Any, missing: float = np.nan) -> np.ndarray:
@@ -228,17 +228,22 @@ class Booster:
             result = np.empty((matrix.num_row(), n_trees), dtype=np.int64)
             if n_trees:
                 features, thresholds, defaults, _ = self._stack(start, end)
-                lib().mxgb_predict_leaf(
-                    addr(matrix.data),
-                    addr(features),
-                    addr(thresholds),
-                    addr(defaults),
-                    addr(result),
+                run_row_kernel(
+                    "mxgb_predict_leaf_range",
+                    (
+                        addr(matrix.data),
+                        addr(features),
+                        addr(thresholds),
+                        addr(defaults),
+                        addr(result),
+                        matrix.num_row(),
+                        matrix.num_col(),
+                        n_trees,
+                        self._max_nodes,
+                    ),
                     matrix.num_row(),
-                    matrix.num_col(),
-                    n_trees,
-                    self._max_nodes,
                     self._n_threads(),
+                    matrix.num_row() * n_trees,
                 )
             return result
         result = np.empty(matrix.num_row(), dtype=np.float64)
@@ -247,19 +252,24 @@ class Booster:
             margin = 0.0
         if n_trees:
             features, thresholds, defaults, leaves = self._stack(start, end)
-            lib().mxgb_predict(
-                addr(matrix.data),
-                addr(features),
-                addr(thresholds),
-                addr(defaults),
-                addr(leaves),
-                addr(result),
+            run_row_kernel(
+                "mxgb_predict_range",
+                (
+                    addr(matrix.data),
+                    addr(features),
+                    addr(thresholds),
+                    addr(defaults),
+                    addr(leaves),
+                    addr(result),
+                    matrix.num_row(),
+                    matrix.num_col(),
+                    n_trees,
+                    self._max_nodes,
+                    margin,
+                ),
                 matrix.num_row(),
-                matrix.num_col(),
-                n_trees,
-                self._max_nodes,
-                margin,
                 self._n_threads(),
+                matrix.num_row() * n_trees,
             )
         else:
             result.fill(margin)

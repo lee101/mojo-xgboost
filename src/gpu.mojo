@@ -25,9 +25,9 @@ Python layer falls back to the CPU kernels.
 """
 
 from std.atomic import Atomic
-from std.gpu import barrier, block_dim, block_idx, global_idx, thread_idx
-from std.gpu.host import DeviceContext
-from std.gpu.memory import AddressSpace
+from max.gpu import barrier, block_dim, block_idx, global_idx, thread_idx
+from max.gpu.host import DeviceContext
+from max.gpu.memory import AddressSpace
 from std.math import isnan
 from std.memory import stack_allocation
 
@@ -63,30 +63,33 @@ def quantize_kernel(
     cuts: UnsafePointer[Float64, AnyOrigin[mut=True]],
     bins: UnsafePointer[Int64, AnyOrigin[mut=True]],
     bins_t: UnsafePointer[Int64, AnyOrigin[mut=True]],
-    n: Int,
-    d: Int,
-    cut_count: Int,
+    n: Int32,
+    d: Int32,
+    cut_count: Int32,
 ):
+    var rows = Int(n)
+    var cols = Int(d)
+    var per_feature = Int(cut_count)
     var i = Int(global_idx.x)
-    if i >= n * d:
+    if i >= rows * cols:
         return
-    var r = i // d
-    var f = i % d
+    var r = i // cols
+    var f = i % cols
     var value = x[i]
     if isnan(value):
         bins[i] = -1
-        bins_t[f * n + r] = -1
+        bins_t[f * rows + r] = -1
         return
     var lo = 0
-    var hi = cut_count
+    var hi = per_feature
     while lo < hi:
         var mid = (lo + hi) // 2
-        if value <= cuts[f * cut_count + mid]:
+        if value <= cuts[f * per_feature + mid]:
             hi = mid
         else:
             lo = mid + 1
     bins[i] = Int64(lo)
-    bins_t[f * n + r] = Int64(lo)
+    bins_t[f * rows + r] = Int64(lo)
 
 
 def hist_kernel(
@@ -96,24 +99,28 @@ def hist_kernel(
     row_nodes: UnsafePointer[Int64, AnyOrigin[mut=True]],
     hist_grad: UnsafePointer[Float64, AnyOrigin[mut=True]],
     hist_hess: UnsafePointer[Float64, AnyOrigin[mut=True]],
-    n: Int,
-    d: Int,
-    max_bin: Int,
-    node: Int,
+    n: Int32,
+    d: Int32,
+    max_bin: Int32,
+    node: Int32,
 ):
     """Accumulate one node's gradient/hessian histogram for one feature.
 
     grid = (row chunks, d); each block owns feature `block_idx.y`. `node < 0`
     means "every row" (the depth-0 histogram).
     """
+    var rows = Int(n)
+    var cols = Int(d)
+    var bins_per_feature = Int(max_bin)
+    var target = Int(node)
     var f = Int(block_idx.y)
-    if f >= d:
+    if f >= cols:
         return
     var sg = stack_allocation[MAX_BIN, Float64, address_space = AddressSpace.SHARED]()
     var sh = stack_allocation[MAX_BIN, Float64, address_space = AddressSpace.SHARED]()
     var tx = Int(thread_idx.x)
     var b = tx
-    while b < max_bin:
+    while b < bins_per_feature:
         sg[b] = 0.0
         sh[b] = 0.0
         b += BLOCK
@@ -121,24 +128,24 @@ def hist_kernel(
 
     var chunk_start = Int(block_idx.x) * ROWS_PER_BLOCK
     var chunk_end = chunk_start + ROWS_PER_BLOCK
-    if chunk_end > n:
-        chunk_end = n
+    if chunk_end > rows:
+        chunk_end = rows
     var r = chunk_start + tx
     while r < chunk_end:
         var take = True
-        if node >= 0:
-            take = Int(row_nodes[r]) == node
+        if target >= 0:
+            take = Int(row_nodes[r]) == target
         if take:
-            var bin = Int(bins_t[f * n + r])
+            var bin = Int(bins_t[f * rows + r])
             if bin >= 0:
                 _ = Atomic.fetch_add(sg + bin, grad[r])
                 _ = Atomic.fetch_add(sh + bin, hess[r])
         r += BLOCK
     barrier()
 
-    var base = f * max_bin
+    var base = f * bins_per_feature
     var k = tx
-    while k < max_bin:
+    while k < bins_per_feature:
         var g = sg[k]
         var h = sh[k]
         if g != 0.0 or h != 0.0:
@@ -155,19 +162,23 @@ def predict_kernel(
     defaults: UnsafePointer[Int64, AnyOrigin[mut=True]],
     leaves: UnsafePointer[Float64, AnyOrigin[mut=True]],
     pred: UnsafePointer[Float64, AnyOrigin[mut=True]],
-    n: Int,
-    d: Int,
-    n_trees: Int,
-    max_nodes: Int,
+    n: Int32,
+    d: Int32,
+    n_trees: Int32,
+    max_nodes: Int32,
     base_margin: Float64,
-    feature_major: Int,
+    feature_major: Int32,
 ):
+    var rows = Int(n)
+    var cols = Int(d)
+    var stride = Int(max_nodes)
+    var transposed = feature_major != 0
     var r = Int(global_idx.x)
-    if r >= n:
+    if r >= rows:
         return
     var margin = base_margin
-    for tree in range(n_trees):
-        var tree_base = tree * max_nodes
+    for tree in range(Int(n_trees)):
+        var tree_base = tree * stride
         var node = 0
         while features[tree_base + node] >= 0:
             var f = Int(features[tree_base + node])
@@ -175,7 +186,7 @@ def predict_kernel(
             # apart — one memory transaction per thread instead of per warp.
             # Feature-major `x_t[f * n + r]` is fully coalesced, because every
             # thread in a warp walks the same node and therefore the same f.
-            var value = x_t[f * n + r] if feature_major != 0 else x[r * d + f]
+            var value = x_t[f * rows + r] if transposed else x[r * cols + f]
             var go_left = False
             if isnan(value):
                 go_left = defaults[tree_base + node] != 0
@@ -236,9 +247,9 @@ def mxgb_gpu_quantize(
             dc,
             db,
             dbt,
-            n,
-            d,
-            cut_count,
+            Int32(n),
+            Int32(d),
+            Int32(cut_count),
             grid_dim=(total + BLOCK - 1) // BLOCK,
             block_dim=BLOCK,
         )
@@ -298,10 +309,10 @@ def mxgb_gpu_hist(
             dn,
             dhg,
             dhh,
-            n,
-            d,
-            max_bin,
-            node,
+            Int32(n),
+            Int32(d),
+            Int32(max_bin),
+            Int32(node),
             grid_dim=(row_chunks, d),
             block_dim=BLOCK,
         )
@@ -359,12 +370,12 @@ def mxgb_gpu_predict(
             dd,
             dl,
             dp,
-            n,
-            d,
-            n_trees,
-            max_nodes,
+            Int32(n),
+            Int32(d),
+            Int32(n_trees),
+            Int32(max_nodes),
             base_margin,
-            1 if x_t_addr != 0 else 0,
+            Int32(1) if x_t_addr != 0 else Int32(0),
             grid_dim=(n + BLOCK - 1) // BLOCK,
             block_dim=BLOCK,
         )

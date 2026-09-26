@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
-from ._lib import addr, lib
+from ._lib import addr, lib, run_row_kernel
 from .core import Booster, DMatrix, _transform
 
 
@@ -291,16 +291,21 @@ def train(
         ]
         leaves *= eta
         model._append(features, thresholds, defaults, leaves, gains, covers)
-        lib().mxgb_predict_add(
-            addr(dtrain.data),
-            addr(features),
-            addr(thresholds),
-            addr(defaults),
-            addr(leaves),
-            addr(margin),
+        run_row_kernel(
+            "mxgb_predict_add_range",
+            (
+                addr(dtrain.data),
+                addr(features),
+                addr(thresholds),
+                addr(defaults),
+                addr(leaves),
+                addr(margin),
+                n,
+                d,
+            ),
             n,
-            d,
             n_threads,
+            n * (round_index + 1),
         )
 
         latest: float | None = None
